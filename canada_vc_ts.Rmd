@@ -1,0 +1,276 @@
+---
+title: "Vaccine Coverage Time Series for Canada"
+author: "Jean-Paul R. Soucy"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+```{r, message=FALSE}
+# load libraries
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(scales)
+library(ggpubr)
+```
+
+# Download the vaccine coverage data from PHAC
+
+```{r}
+# encode population values for provinces/territories
+# https://health-infobase.canada.ca/covid-19/vaccination-coverage/technical-notes.html#a6
+# July 1, 2021 population estimates used as denominators for report weeks January 9, 2021 onwards for all provinces and Nunavut
+# StatCan Q3 2021 estimates: https://www150.statcan.gc.ca/t1/tbl1/en/tv.action?pid=1710000901)
+# Yukon denominator data for report weeks January 9, 2021 onwards were obtained from the Yukon Bureau of Statistics and corresponds to population size estimates as of March 31, 2021
+# Northwest Territories denominator data for report weeks January 9, 2021 onwards were obtained from the Government of the Northwest Territories and corresponds to population size estimates as of August 1, 2021
+pop <- matrix(c(
+  "Alberta", 4442879,
+  "British Columbia", 5214805,
+  "Manitoba", 1383765,
+  "New Brunswick", 789225,
+  "Newfoundland and Labrador", 520553,
+  "Northwest Territories", 45504, # can't find estimate for August 1, 2021
+  "Nova Scotia", 992055,
+  "Nunavut", 39403,
+  "Ontario", 14826276,
+  "Prince Edward Island", 164318,
+  "Quebec", 8604495,
+  "Saskatchewan", 1179844,
+  "Yukon", 43025, # March 31, 2021 estimate
+  "Canada", 38246108),
+  ncol = 2, byrow = TRUE)
+pop <- data.frame(pt = pop[, 1], pop = as.integer(pop[, 2]))
+```
+
+We begin by downloading the weekly [COVID-19 vaccine coverage dataset](https://health-infobase.canada.ca/covid-19/vaccination-coverage/) from the Public Health Agency of Canada (PHAC), keeping only the columns we care about.
+
+These data are reported weekly on Fridays and include data up to the previous Saturday. For our purposes, we will treat these as weekly counts on a Monday to Sunday cycle.
+
+```{r, echo=TRUE}
+# download vaccine coverage dataset from PHAC
+# dir.create("raw", showWarnings = FALSE)
+# download.file("https://health-infobase.canada.ca/src/data/covidLive/vaccination-coverage-map.csv", "raw/vaccination-coverage-map.csv")
+
+# load vaccine coverage dataset (downloaded 2021-01-18)
+vc <- read.csv("raw/vaccination-coverage-map.csv", stringsAsFactors = FALSE)
+```
+
+```{r, results='hide', message=FALSE, warning=FALSE}
+# rename variables
+vc <- vc %>%
+  transmute(date = as.Date(week_end),
+            pt = factor(prename, levels = unique(pop$pt)),
+            n_dose_1 = numtotal_atleast1dose,
+            n_dose_2 = numtotal_fully,
+            n_dose_3 = numtotal_additional,
+            percent_dose_1 = proptotal_atleast1dose,
+            percent_dose_2 = proptotal_fully,
+            percent_dose_3 = proptotal_additional)
+
+# ensure our population values are the same as those used by PHAC
+temp <- vc %>%
+  filter(date >= as.Date("2021-01-09")) %>%
+  left_join(pop, by = "pt") %>%
+  mutate(
+    percent_dose_1_calc = round(n_dose_1 / pop * 100, 2),
+    percent_dose_2_calc = round(n_dose_2 / pop * 100, 2),
+    percent_dose_3_calc = round(n_dose_3 / pop * 100, 2)
+  )
+
+# are there any cases where our calculated dose 1 coverage doesn't line up with what's in the raw dataset?
+temp %>%
+  filter(percent_dose_1 != percent_dose_1_calc) %>%
+  {table(.$pt)}
+# okay, clearly the population values for Yukon and Northwest territories are wrong
+# it appears some random Canada values are off too, but we won't worry about that
+
+# let's calculate the implied population values from the PHAC dataset
+# we'll use these to ensure compatibility with the rest of the PHAC coverage dataset
+
+# Northwest Territories
+vc %>% filter(date == as.Date("2022-01-08") & pt == "Northwest Territories") %>%
+  mutate(implied_pop = n_dose_1 / percent_dose_1 * 100)
+# implied population is 43474
+# this seems a bit low but may be explained as the difference between population
+# and population covered by the territorial health insurance plan, which seems
+# to be the number they use
+# NWT dashboard reports 79% total population first dose coverage as of
+# 2021-01-18, which lines up w/ PHAC estimate
+# https://nwt-covid.shinyapps.io/Testing-and-Cases/?lang=1
+pop[pop$pt == "Northwest Territories", "pop"] <- 43474
+
+# Yukon
+vc %>% filter(date == as.Date("2022-01-08") & pt == "Yukon") %>%
+  mutate(implied_pop = n_dose_1 / percent_dose_1 * 100)
+# implied population is 42946
+# Yukon does not independently report vaccine coverage for total population,
+# only eligible population - nothing to compare to
+pop[pop$pt == "Yukon", "pop"] <- 42946
+
+# we will leave the Canadian population total alone despite changes
+```
+
+```{r, echo=TRUE}
+# keep coverage variables
+vc <- vc %>%
+  filter(pt != "Canada") %>%
+  select(date, pt, percent_dose_1, percent_dose_2, percent_dose_3)
+```
+
+# Inspect the vaccine coverage data from PHAC
+
+Let's take a look at vaccine coverage by dose in each province/territory...
+
+```{r, message=FALSE, warning=FALSE}
+cols <- setNames(hue_pal()(3), c("Dose 1", "Dose 2", "Dose 3"))
+ggplot(data = vc, aes(x = date)) +
+  geom_line(aes(y = percent_dose_1, color = "Dose 1")) +
+  geom_line(aes(y = percent_dose_2, color = "Dose 2")) +
+  geom_line(aes(y = percent_dose_3, color = "Dose 3")) +
+  scale_x_date(date_labels = "%b") +
+  scale_color_manual(values = cols) +
+  facet_wrap(~pt) +
+  labs(x = "Date", y = "Vaccine coverage (%)", color = "Dose number") +
+  theme_pubclean() +
+  theme(plot.background = element_rect(colour = "black", fill = NA, size = 0.5))
+```
+
+For the most part, the first and second dose coverage time series look good, with two exceptions:
+
+* Yukon time series has several "steps" due to irregular updates.
+* Northwest Territories coverage declines partway through 2020. My guess is that they previously included vaccines given to non-residents in the numerator (but not the denominator), but then switched to including only residents partway through the time series. Given the way this value was reported by the territory, I don't think there is any way to correct this.
+
+The third dose time series are lacking, beginning in early December 2020 or later and being completely absent for several provinces. These time series will be rewritten using the [COVID-19 Canada Open Data Working Group](https://github.com/ccodwg/Covid19Canada) (CCODWG) "additional doses" time series. The only exceptions are Nunavut, which does not currently report third doses except through the Public Health Agency of Canada, and the Northwest Territories, due to issues with separating out vaccinations of residents and non-residents.
+
+# Add the third dose time series from CCODWG
+
+```{r, echo=TRUE}
+# download additional doses dataset from CCODWG
+# download.file("https://raw.githubusercontent.com/ccodwg/Covid19Canada/master/timeseries_prov/vaccine_additionaldoses_timeseries_prov.csv", "raw/vaccine_additionaldoses_timeseries_prov.csv")
+
+# load vaccine coverage dataset (downloaded 2021-01-18)
+dose3 <- read.csv("raw/vaccine_additionaldoses_timeseries_prov.csv", stringsAsFactors = FALSE)
+```
+
+```{r}
+# format the data for compatibility
+dose3 <- dose3 %>%
+  transmute(
+    date = as.Date(date_vaccine_additionaldoses, "%d-%m-%Y"),
+    pt = case_when(
+      province == "BC" ~ "British Columbia",
+      province == "NL" ~ "Newfoundland and Labrador",
+      province == "NWT" ~ "Northwest Territories",
+      province == "PEI" ~ "Prince Edward Island",
+      TRUE ~ province
+    ),
+    n_dose_3_new = cumulative_additionaldosesvaccine
+  )
+```
+
+Let's calculate third dose coverage using the CCODWG dataset.
+
+```{r, echo=TRUE}
+# calculate third dose coverage
+dose3 <- dose3 %>%
+  # join population values
+  left_join(pop, by = "pt") %>%
+  # remove NU and NWT
+  filter(!pt %in% c("Nunavut", "Northwest Territories")) %>%
+  # remove 0 values (before third doses were reported)
+  filter(n_dose_3_new != 0) %>%
+  # calculate third dose coverage
+  mutate(percent_dose_3_new = round(n_dose_3_new / pop * 100, 2))
+```
+
+Reporting of third doses was significantly different between provinces and territories. For example, provinces like British Columbia and Alberta started reporting much earlier than other jurisdictions. We will begin the time series on October 3, 2021, as a reasonable number of jurisdictions had begun reporting by this date.
+
+To join back to the original VC coverage dataset, we will keep the Sunday reported value of each week (since data reported on Sunday corresponds to data current up to Saturday, as in the original dataset).
+
+```{r, echo=TRUE}
+# keep relevant data
+dose3 <- dose3 %>%
+  # keep Sundays beginning with October 3, 2021
+  filter(date %in% seq.Date(from = as.Date("2021-10-3"), to = max(vc$date) + 1, by = "7 days")) %>%
+  # subtract one day to join with original dataset
+  mutate(date = date - 1) %>%
+  # keep relevant variables
+  select(date, pt, n_dose_3_new, percent_dose_3_new)
+
+# join datasets
+vc <- vc %>%
+  left_join(dose3, by = c("date", "pt"))
+```
+
+Let's see what the old and new third dose datasets look like.
+
+```{r, message=FALSE, warning=FALSE}
+cols <- setNames(hue_pal()(2), c("Original", "New"))
+ggplot(data = vc %>% filter(date >= as.Date("2021-10-3")), aes(x = date)) +
+  geom_line(aes(y = percent_dose_3, color = "Original")) +
+  geom_line(aes(y = percent_dose_3_new, color = "New")) +
+  scale_x_date(date_labels = "%b") +
+  scale_color_manual(values = cols) +
+  facet_wrap(~pt) +
+  labs(x = "Date", y = "Dose 3 vaccine coverage (%)", color = "Dataset") +
+  theme_pubclean() +
+  theme(plot.background = element_rect(colour = "black", fill = NA, size = 0.5))
+```
+
+Much better!
+
+Note that our Saskatchewan value differs somewhat from the original PHAC dataset. To speculate, this may be due to different reporting delays (recall that Saskatchewan only publicly reports once per week) or because the PHAC dataset includes both third and fourth doses in the calculation, whereas the province reports these two values separately (the CCODWG dataset only counts third doses).
+
+```{r}
+# format final dataset
+vc <- vc %>%
+  transmute(
+    date,
+    pt,
+    percent_dose_1,
+    percent_dose_2,
+    # replace all but NU and NWT datasets
+    percent_dose_3 = case_when(
+      pt %in% c("Nunavut", "Northwest Territories") ~ percent_dose_3,
+      TRUE ~ percent_dose_3_new
+    )
+  )
+
+# long version of dataset
+vc_long <- vc %>%
+  pivot_longer(
+    cols = c("percent_dose_1", "percent_dose_2", "percent_dose_3"),
+    names_prefix = "percent_",
+    names_to = "dose",
+    values_to = "coverage") %>%
+  filter(!is.na(coverage))
+```
+
+# Final dataset
+
+And now a plot of the final dataset:
+
+```{r, message=FALSE, warning=FALSE}
+cols <- setNames(hue_pal()(3), c("dose_1", "dose_2", "dose_3"))
+ggplot(data = vc_long, aes(x = date, y = coverage, group = dose, color = dose)) +
+  geom_line() +
+  scale_x_date(date_labels = "%b") +
+  scale_color_manual(values = cols, labels = c("Dose 1", "Dose 2", "Dose 3")) +
+  facet_wrap(~pt) +
+  labs(x = "Date", y = "Vaccine coverage (%)", color = "Dose number") +
+  theme_pubclean() +
+  theme(plot.background = element_rect(colour = "black", fill = NA, size = 0.5))
+```
+
+```{r}
+# export dataset
+dir.create("data", showWarnings = FALSE)
+write.csv(vc, "data/canada_vc_ts.csv", row.names = FALSE)
+write.csv(vc_long, "data/canada_vc_ts_long.csv", row.names = FALSE)
+```
+
+Recall that the vaccine coverage data are dated as being current up to the given Saturday, but we should be okay treating these as weekly coverage values on a Monday to Sunday cycle.
